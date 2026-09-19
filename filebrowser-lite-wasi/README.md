@@ -55,6 +55,24 @@ wasmtime run \
 - The repository's `.cargo/config.toml` enables Tokio's unstable WASIp2 network
   support during native and component builds.
 
+## Runtime Limitations
+
+This experimental backend uses one current-thread Tokio runtime for every
+connection. Image decoding/resizing/encoding and filesystem operations run
+synchronously. Large previews, recursive copies/deletes, and the final write of
+an upload can therefore delay all other requests, including health checks,
+until the synchronous operation returns.
+
+The synchronous operations also existed in the former incoming-handler backend.
+The run-only model now shares one guest execution thread across requests, instead
+of relying on the host HTTP server to schedule component instances. Bounded
+upload buffering does not remove this scheduling limitation.
+
+For this experimental tool, this limitation is accepted for now. Removing it
+requires work that can yield throughout its execution or an independently
+scheduled worker; wrapping synchronous work in `tokio::spawn` does not isolate it.
+No responsiveness guarantee is made during expensive operations.
+
 ## Upload Regression Tests
 
 The HTTP tests require Python 3.11+ and use only its standard library. They start

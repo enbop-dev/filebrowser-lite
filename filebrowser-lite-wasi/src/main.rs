@@ -1,8 +1,8 @@
 use bytes::Bytes;
 use http::response::Builder;
-use http::{HeaderMap, Method, Request, Response, StatusCode};
+use http::{HeaderMap, Method, Request, Response, StatusCode, header};
 use http_body_util::{BodyExt, Full};
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -11,10 +11,11 @@ use rust_embed::Embed;
 use serde::Serialize;
 use std::convert::Infallible;
 use std::env;
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::SystemTime;
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -25,7 +26,12 @@ const RESOURCES_PREFIX: &str = "/api/resources";
 const RAW_PREFIX: &str = "/api/raw";
 const PREVIEW_PREFIX: &str = "/api/preview";
 
-type AppRequest = Request<Vec<u8>>;
+struct RequestBody {
+    stream: Incoming,
+    consumed: bool,
+}
+
+type AppRequest = Request<RequestBody>;
 type AppResponse = Response<Vec<u8>>;
 
 #[derive(Embed)]
@@ -155,19 +161,27 @@ fn parse_listen_address() -> Result<SocketAddr, Box<dyn std::error::Error>> {
 async fn handle_hyper_request(
     request: Request<Incoming>,
 ) -> Result<Response<Full<Bytes>>, Infallible> {
-    let (parts, body) = request.into_parts();
-    let response = match body.collect().await {
-        Ok(body) => match route(Request::from_parts(parts, body.to_bytes().to_vec())).await {
-            Ok(response) => response,
-            Err(error) => json_error(error),
-        },
-        Err(error) => json_error(ApiError::new(StatusCode::BAD_REQUEST, error.to_string())),
+    let mut request = request.map(|stream| RequestBody {
+        consumed: stream.is_end_stream(),
+        stream,
+    });
+    let mut response = match route(&mut request).await {
+        Ok(response) => response,
+        Err(error) => json_error(error),
     };
+    // Never drain an unwanted or failed upload just to keep HTTP/1 alive.
+    // Closing also prevents unread body bytes being interpreted as a new request.
+    if !request.body().consumed {
+        response.headers_mut().insert(
+            header::CONNECTION,
+            header::HeaderValue::from_static("close"),
+        );
+    }
     let (parts, body) = response.into_parts();
     Ok(Response::from_parts(parts, Full::new(Bytes::from(body))))
 }
 
-async fn route(mut request: AppRequest) -> Result<AppResponse, ApiError> {
+async fn route(request: &mut AppRequest) -> Result<AppResponse, ApiError> {
     let path = request.uri().path().to_string();
     let method = request.method().clone();
 
@@ -180,9 +194,9 @@ async fn route(mut request: AppRequest) -> Result<AppResponse, ApiError> {
                 message: "filebrowser-lite-wasi is running",
             },
         )),
-        _ if path_matches_prefix(&path, RESOURCES_PREFIX) => handle_resources(&mut request).await,
-        _ if path_matches_prefix(&path, RAW_PREFIX) => handle_raw(&request).await,
-        _ if path_matches_prefix(&path, PREVIEW_PREFIX) => handle_preview(&request).await,
+        _ if path_matches_prefix(&path, RESOURCES_PREFIX) => handle_resources(request).await,
+        _ if path_matches_prefix(&path, RAW_PREFIX) => handle_raw(request).await,
+        _ if path_matches_prefix(&path, PREVIEW_PREFIX) => handle_preview(request).await,
         _ => serve_asset_route(&path),
     }
 }
@@ -237,35 +251,15 @@ async fn handle_resources(request: &mut AppRequest) -> Result<AppResponse, ApiEr
                 return Ok(json_response(StatusCode::OK, &resource));
             }
 
-            let override_existing = query_flag(query, "override");
-            if path_info.host_path.exists() && !override_existing {
-                return Err(ApiError::new(
-                    StatusCode::CONFLICT,
-                    "target already exists; pass override=true to replace it",
-                ));
-            }
-
             write_request_body(request, &path_info.host_path).await?;
-            let resource = read_resource(&path_info.guest_path, &path_info.host_path)?;
+            let resource =
+                read_resource_with_content(&path_info.guest_path, &path_info.host_path, false)?;
             Ok(json_response(StatusCode::OK, &resource))
         }
         Method::PUT => {
-            if !path_info.host_path.exists() {
-                return Err(ApiError::new(
-                    StatusCode::NOT_FOUND,
-                    "target file does not exist",
-                ));
-            }
-
-            if path_info.host_path.is_dir() {
-                return Err(ApiError::new(
-                    StatusCode::METHOD_NOT_ALLOWED,
-                    "PUT only supports files",
-                ));
-            }
-
             write_request_body(request, &path_info.host_path).await?;
-            let resource = read_resource(&path_info.guest_path, &path_info.host_path)?;
+            let resource =
+                read_resource_with_content(&path_info.guest_path, &path_info.host_path, false)?;
             Ok(json_response(StatusCode::OK, &resource))
         }
         Method::PATCH => handle_patch(query, &path_info).await,
@@ -485,6 +479,14 @@ fn file_metadata(path: &Path) -> Result<fs::Metadata, ApiError> {
 }
 
 fn read_resource(guest_path: &str, host_path: &Path) -> Result<Resource, ApiError> {
+    read_resource_with_content(guest_path, host_path, true)
+}
+
+fn read_resource_with_content(
+    guest_path: &str,
+    host_path: &Path,
+    include_content: bool,
+) -> Result<Resource, ApiError> {
     let metadata = fs::metadata(host_path).map_err(|err| match err.kind() {
         std::io::ErrorKind::NotFound => ApiError::new(StatusCode::NOT_FOUND, "path not found"),
         _ => io_error(StatusCode::INTERNAL_SERVER_ERROR, err),
@@ -546,7 +548,7 @@ fn read_resource(guest_path: &str, host_path: &Path) -> Result<Resource, ApiErro
 
     let extension = extension_for_name(&name);
     let resource_type = detect_file_type(&name);
-    let content = if is_text_resource(&resource_type) {
+    let content = if include_content && is_text_resource(&resource_type) {
         Some(
             fs::read_to_string(host_path)
                 .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?,
@@ -603,21 +605,127 @@ fn read_resource_item(guest_path: &str, host_path: &Path) -> Result<ResourceItem
     })
 }
 
-async fn write_request_body(request: &mut AppRequest, host_path: &Path) -> Result<(), ApiError> {
-    if let Some(parent) = host_path.parent() {
-        fs::create_dir_all(parent)
-            .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
+fn validate_upload_target(request: &AppRequest, host_path: &Path) -> Result<(), ApiError> {
+    if request.method() == Method::POST
+        && host_path.exists()
+        && !query_flag(request.uri().query().unwrap_or(""), "override")
+    {
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "target already exists; pass override=true to replace it",
+        ));
+    }
+    if request.method() == Method::PUT && !host_path.exists() {
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "target file does not exist",
+        ));
+    }
+    if host_path.is_dir() {
+        return Err(ApiError::new(
+            StatusCode::METHOD_NOT_ALLOWED,
+            "uploads only support files",
+        ));
+    }
+    Ok(())
+}
+
+// Stage on disk until the entire body arrives; transport failures must not
+// truncate an existing file. Keep staging within the granted storage directory.
+// Dropping this guard also cleans up on a body error or cancelled request task.
+struct PendingUpload {
+    file: Option<File>,
+    path: PathBuf,
+}
+
+impl PendingUpload {
+    fn new(destination: &Path) -> Result<Self, ApiError> {
+        let parent = destination.parent().unwrap_or(Path::new("."));
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        static NEXT_UPLOAD: AtomicU64 = AtomicU64::new(0);
+        for _ in 0..32 {
+            let id = NEXT_UPLOAD.fetch_add(1, Ordering::Relaxed);
+            let path = parent.join(format!(".filebrowser-upload-{nonce:x}-{id:x}.tmp"));
+            if path == destination {
+                continue;
+            }
+            match OpenOptions::new()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        file: Some(file),
+                        path,
+                    });
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => return Err(io_error(StatusCode::INTERNAL_SERVER_ERROR, error)),
+            }
+        }
+        Err(ApiError::new(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "could not create upload staging file",
+        ))
     }
 
-    let body = std::mem::take(request.body_mut());
+    fn commit(mut self, destination: &Path) -> Result<(), ApiError> {
+        let mut staged = self.file.take().unwrap();
+        staged
+            .seek(SeekFrom::Start(0))
+            .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        // Write through the destination as before, preserving its permissions and
+        // hard/symbolic links. Renaming the staging file would replace its inode.
+        let mut destination = File::create(destination)
+            .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        std::io::copy(&mut staged, &mut destination)
+            .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        destination
+            .sync_all()
+            .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))
+    }
+}
 
-    let mut file =
-        File::create(host_path).map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    file.write_all(&body)
-        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    file.sync_all()
-        .map_err(|err| io_error(StatusCode::INTERNAL_SERVER_ERROR, err))?;
-    Ok(())
+impl Drop for PendingUpload {
+    fn drop(&mut self) {
+        // Close first: Windows cannot remove an open file.
+        self.file.take();
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+async fn write_request_body(request: &mut AppRequest, host_path: &Path) -> Result<(), ApiError> {
+    validate_upload_target(request, host_path)?;
+    let parent = host_path.parent().unwrap_or(Path::new("."));
+    fs::create_dir_all(parent)
+        .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+    let mut upload = PendingUpload::new(host_path)?;
+
+    while let Some(frame) = request.body_mut().stream.frame().await {
+        let frame =
+            frame.map_err(|error| ApiError::new(StatusCode::BAD_REQUEST, error.to_string()))?;
+        if let Ok(data) = frame.into_data() {
+            upload
+                .file
+                .as_mut()
+                .unwrap()
+                .write_all(&data)
+                .map_err(|error| io_error(StatusCode::INTERNAL_SERVER_ERROR, error))?;
+        }
+    }
+
+    // Incoming::is_end_stream() can remain false for chunked HTTP/1 bodies,
+    // even after all frames (including trailers) have been consumed.
+    request.body_mut().consumed = true;
+
+    // Other requests can change the target while this upload awaits its body.
+    validate_upload_target(request, host_path)?;
+    upload.commit(host_path)
 }
 
 fn rename_path(source: &Path, destination: &Path) -> Result<(), ApiError> {
